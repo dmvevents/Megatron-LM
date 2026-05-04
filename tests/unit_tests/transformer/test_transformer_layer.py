@@ -11,7 +11,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.tensor_parallel.random import CheckpointManager, model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutputManager,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -404,7 +407,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
         # Create manager for MHC block recomputation
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         # Forward pass with recompute manager
         manager.is_last_layer_in_recompute_block = True
@@ -451,7 +454,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         # Forward pass - NOT the last layer in block
         manager.is_last_layer_in_recompute_block = False
@@ -478,7 +481,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
     def test_multiple_layers_chain_with_recompute(self):
         """
         Test multiple TransformerLayers chained together with a single
-        CheckpointManager, simulating TransformerBlock behavior.
+        CheckpointWithoutOutputManager, simulating TransformerBlock behavior.
         """
         hidden_size = 64
         num_streams = 4
@@ -503,7 +506,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
         # Single manager for all layers (like TransformerBlock)
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         # Forward through all layers
         h = hidden_states
@@ -549,7 +552,7 @@ class TestMHCRecomputeMemorySaving:
     ):
         """Run a full forward + backward pass and return (peak memory, output grad).
 
-        When use_recompute=True, a new CheckpointManager is created every
+        When use_recompute=True, a new CheckpointWithoutOutputManager is created every
         `recompute_block_size` layers, mirroring TransformerBlock's
         _build_mhc_recompute_layer_plan logic.
         """
@@ -579,7 +582,7 @@ class TestMHCRecomputeMemorySaving:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
 
-        manager = CheckpointManager() if use_recompute else None
+        manager = CheckpointWithoutOutputManager() if use_recompute else None
 
         h = hidden_states
         for i, layer in enumerate(layers):
@@ -592,7 +595,7 @@ class TestMHCRecomputeMemorySaving:
             if manager is not None and is_last_in_block:
                 manager.discard_all_outputs_and_register_unified_recompute(h)
                 if i < num_layers - 1:
-                    manager = CheckpointManager()
+                    manager = CheckpointWithoutOutputManager()
 
         loss = h.sum()
         loss.backward()
@@ -816,9 +819,9 @@ class TestMHCWithCudaGraph:
         )
 
     def test_cuda_graph_fwd_bwd_with_hyper_connection_and_recompute(self):
-        """CUDA graph capture+replay for fwd+bwd with mHC and CheckpointManager.
+        """CUDA graph capture+replay for fwd+bwd with mHC and CheckpointWithoutOutputManager.
 
-        When a CheckpointManager is used, additional CheckpointWithoutOutput
+        When a CheckpointWithoutOutputManager is used, additional CheckpointWithoutOutput
         objects are created for layernorm and hyper-connection operations. The
         manager discards intermediate activations during forward (storage.resize_(0))
         and recomputes them during backward via a unified gradient hook.
@@ -841,7 +844,7 @@ class TestMHCWithCudaGraph:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                mgr = CheckpointManager()
+                mgr = CheckpointWithoutOutputManager()
                 mgr.is_last_layer_in_recompute_block = True
                 out, _ = layer(
                     hidden_states=static_input,
@@ -855,7 +858,7 @@ class TestMHCWithCudaGraph:
         layer.zero_grad(set_to_none=True)
         static_input.grad = None
 
-        capture_mgr = CheckpointManager()
+        capture_mgr = CheckpointWithoutOutputManager()
         capture_mgr.is_last_layer_in_recompute_block = True
 
         g = torch.cuda.CUDAGraph()
@@ -893,7 +896,7 @@ class TestMHCWithCudaGraph:
         graph_out = output.detach().clone()
         graph_grad = static_input.grad.detach().clone()
 
-        eager_mgr = CheckpointManager()
+        eager_mgr = CheckpointWithoutOutputManager()
         eager_mgr.is_last_layer_in_recompute_block = True
         eager_input = test_data.clone().requires_grad_(True)
         eager_output, _ = layer(
@@ -916,10 +919,12 @@ class TestMHCWithCudaGraph:
     def test_mcore_cudagraph_manager_with_mhc_recompute_manager(self):
         """MCore CudaGraphManager must not crash on mhc_recompute_manager kwarg.
 
-        When cuda_graph_impl="local" is set, TransformerLayer.__call__ routes
-        through MegatronModule.__call__ → CudaGraphManager.__call__, which
-        iterates over all kwargs to check supported types. CheckpointManager
-        (used by mhc_recompute_manager) is not a CUDA-graph-supported type.
+        When cuda_graph_impl="local" is set, HyperConnectionTransformerLayer.__call__
+        runs first and pops mhc_recompute_manager off kwargs before
+        super().__call__ → MegatronModule.__call__ → CudaGraphManager.__call__,
+        which iterates over all kwargs to check supported types.
+        CheckpointWithoutOutputManager (used by mhc_recompute_manager) is not a
+        CUDA-graph-supported type.
 
         This test verifies that mhc_recompute_manager is properly extracted
         from kwargs before the CudaGraphManager sees them, preventing the
@@ -941,7 +946,7 @@ class TestMHCWithCudaGraph:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        mgr = CheckpointManager()
+        mgr = CheckpointWithoutOutputManager()
         mgr.is_last_layer_in_recompute_block = True
 
         output, context = layer(
